@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# MIT License
+#
+# Copyright (c) 2026 Takashi Kawamoto (Mr.Mo)
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# Source-derived frontier: open type:task + ai:ready, all blockers CLOSED.
+# Requires gh with the blockedBy JSON field; unsupported/missing data refuses.
+# Usage: bash .agents/skills/plan-management/scripts/frontier.sh [-R owner/repo] [--all]
+set -euo pipefail
+REPO_ARGS=()
+SHOW_ALL=false
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -R|--repo) [ -n "${2:-}" ] || exit 2; REPO_ARGS=(--repo "$2"); shift 2 ;;
+    --all) SHOW_ALL=true; shift ;;
+    -h|--help) printf '%s\n' 'Usage: bash .agents/skills/plan-management/scripts/frontier.sh [-R owner/repo] [--all]'; exit 0 ;;
+    *) printf '%s\n' 'error: unknown option' >&2; exit 2 ;;
+  esac
+done
+fail() { printf 'UNCHECKABLE: %s\n' "$1" >&2; exit 1; }
+command -v gh >/dev/null 2>&1 || fail 'gh CLI not found'
+# Resolve one selected host/repository before comparing bare, repository-only
+# and URL-qualified dependency identities. Foreign-host edges are unsupported.
+REPO_VIEW_ARGS=()
+if [ -n "${REPO_ARGS[1]:-}" ]; then REPO_VIEW_ARGS=("${REPO_ARGS[1]}"); fi
+# shellcheck disable=SC2016
+REPOSITORY="$(gh repo view ${REPO_VIEW_ARGS[@]+"${REPO_VIEW_ARGS[@]}"} --json url,nameWithOwner --jq '
+  if (.url | type) != "string" or (.nameWithOwner | type) != "string"
+  then error("missing repository identity") else
+    (.url | capture("^https://(?<host>[A-Za-z0-9][A-Za-z0-9.-]{0,252})/(?<repo>[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_][A-Za-z0-9_.-]{0,99})\\z")) as $url |
+    if ($url.repo | ascii_downcase) == (.nameWithOwner | ascii_downcase)
+    then [$url.host, $url.repo] | map(ascii_downcase) | @tsv
+    else error("inconsistent repository identity") end
+  end')" || fail 'selected repository identity unavailable'
+repository_pattern=$'^[a-z0-9][a-z0-9.-]{0,252}\t[a-z0-9][a-z0-9-]{0,38}/[a-z0-9_][a-z0-9_.-]{0,99}$'
+[[ "$REPOSITORY" =~ $repository_pattern ]] || fail 'malformed selected repository identity'
+HOST="${REPOSITORY%%$'\t'*}"
+REPO="${REPOSITORY#*$'\t'}"
+if [ -n "${REPO_ARGS[1]:-}" ]; then
+  requested="$(printf '%s' "${REPO_ARGS[1]}" | tr '[:upper:]' '[:lower:]')"
+  [ "$requested" = "$REPO" ] || [ "$requested" = "$HOST/$REPO" ] || fail 'selected repository differs from request'
+fi
+REPO_ARGS=(--repo "$HOST/$REPO")
+# Source-derived invocation-local cache. Indexed arrays and an explicit count
+# support Bash 3.2 under nounset, including the initially empty cache. Call this
+# function directly: a command-substitution subshell would discard cache writes.
+# Keys use the already validated canonical host/repository plus Issue number.
+# This is a bounded observation reused within this invocation, not an atomic
+# snapshot, a real-time lock or evidence that the state cannot change later.
+CACHE_KEYS=()
+CACHE_STATES=()
+CACHE_COUNT=0
+blocker_state() {
+  local number="$1" repository="$2" key i
+  key="$repository#$number"
+  for ((i=0; i<CACHE_COUNT; i++)); do
+    if [ "${CACHE_KEYS[$i]}" = "$key" ]; then
+      STATE="${CACHE_STATES[$i]}"
+      return 0
+    fi
+  done
+  STATE="$(gh issue view "$number" --repo "$repository" --json state --jq .state)" \
+    || fail 'blocker state retrieval failed'
+  case "$STATE" in OPEN|CLOSED) ;; *) fail 'unknown blocker state' ;; esac
+  CACHE_KEYS[CACHE_COUNT]="$key"
+  CACHE_STATES[CACHE_COUNT]="$STATE"
+  CACHE_COUNT=$((CACHE_COUNT + 1))
+}
+# Main-shell capture: a command failure cannot masquerade as an empty list.
+LIST="$(gh issue list ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --state open --label type:task --label ai:ready \
+  --limit 200 --json number,title --template '{{range .}}{{.number}}{{"\t"}}{{.title}}{{"\n"}}{{end}}')" \
+  || fail 'Task list retrieval failed'
+if [ -z "$LIST" ]; then printf '%s\n' 'No open Task issues labeled ai:ready.'; exit 0; fi
+READY=""
+BLOCKED=""
+COUNT=0
+while IFS= read -r line; do
+  num="${line%%$'\t'*}"
+  title="${line#*$'\t'}"
+  [[ "$num" =~ ^[1-9][0-9]*$ ]] && [ "$title" != "$line" ] || fail 'malformed Task list'
+  COUNT=$((COUNT + 1))
+  [ "$COUNT" -lt 200 ] || fail 'Task list may be truncated; inspect the frontier manually'
+  # gh 2.96.0 returns a connection capped at 50 nodes. Prove completeness
+  # before publishing anything. Retain tested flat-array compatibility only;
+  # it is not a claim about every gh version. Missing data is never empty.
+  # shellcheck disable=SC2016
+  refs="$(gh issue view "$num" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --json blockedBy \
+    --jq '"'"$HOST"'" as $host | "'"$REPO"'" as $selected |
+      def integer: type == "number" and . >= 0 and . == floor;
+      def repo_name: type == "string" and length <= 140 and
+        test("^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}\\z");
+      def repository:
+        if has("repository") then .repository |
+          if type != "object" then error("invalid repository")
+          else
+            (if has("name") or has("owner") then
+              if (.name | type) != "string" or (.owner.login | type) != "string"
+              then error("invalid repository fields") else .owner.login + "/" + .name end
+             else null end) as $parts |
+            (if has("nameWithOwner") then .nameWithOwner else $parts end) as $name |
+            if ($name | repo_name) and ($parts == null or
+                ($parts | ascii_downcase) == ($name | ascii_downcase))
+            then $name else error("invalid or inconsistent repository") end
+          end
+        else null end;
+      .blockedBy |
+      (if type == "array" then .
+       elif type == "object" and (.nodes | type) == "array" and
+         (.totalCount | integer) and .totalCount == (.nodes | length) and .totalCount <= 50
+       then .nodes else error("missing, malformed or incomplete blockers") end) |
+      map(
+        if type != "object" or ((.number | integer) | not) or .number < 1
+        then error("invalid blocker") else . end |
+        . as $node | repository as $repo |
+        if has("url") then
+          if (.url | type) != "string" or
+            ((.url | test("^https://[A-Za-z0-9][A-Za-z0-9.-]{0,252}/[^/]+/[^/]+/issues/[1-9][0-9]*\\z")) | not)
+          then error("invalid blocker URL") else
+            (.url | capture("^https://(?<host>[^/]+)/(?<repo>[^/]+/[^/]+)/issues/(?<number>[0-9]+)\\z")) as $url |
+            if ($url.repo | repo_name) and ($url.host | ascii_downcase) == $host and
+              ($url.number | tonumber) == $node.number and
+              ($repo == null or ($repo | ascii_downcase) == ($url.repo | ascii_downcase))
+            then [$node.number, ($host + "/" + ($url.repo | ascii_downcase))]
+            else error("inconsistent blocker identity") end
+          end
+        else [$node.number, ($host + "/" + (($repo // $selected) | ascii_downcase))] end
+      ) | if (unique_by([.[0], (.[1] | ascii_downcase)]) | length) == length then .[] | @tsv
+          else error("duplicate blocker identity") end')" \
+    || fail 'dependency retrieval failed or unsupported; inspect the Issue graph manually'
+  blocked=false
+  if [ -n "$refs" ]; then
+    while IFS=$'\t' read -r ref blocker_repo; do
+      [[ "$ref" =~ ^[1-9][0-9]*$ ]] || fail 'malformed blocker reference'
+      blocker_state "$ref" "$blocker_repo"
+      case "$STATE" in CLOSED) ;; OPEN) blocked=true ;; *) fail 'unknown blocker state' ;; esac
+    done <<< "$refs"
+  fi
+  if "$blocked"; then BLOCKED+="#$num"$'\t'"$title"$'\n'
+  else READY+="#$num"$'\t'"$title"$'\n'; fi
+done <<< "$LIST"
+# Publish no partial actionable list when a later observation fails.
+printf '%s\n' '== Actionable frontier (all dependency observations succeeded) =='
+printf '%s' "$READY"
+if "$SHOW_ALL" && [ -n "$BLOCKED" ]; then
+  printf '%s\n' '== Blocked =='
+  printf '%s' "$BLOCKED"
+fi
